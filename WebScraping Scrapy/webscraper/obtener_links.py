@@ -25,6 +25,8 @@ import logging
 import pprint
 import random
 import pandas as pd
+from multiprocessing import Process, Manager
+
 '''
             'link': response.url,
             'sku': response.xpath(self.xpath_sku).get(default='').strip(),
@@ -85,6 +87,7 @@ class Description_Sku_Spider(scrapy.Spider):
 
     def start_requests(self):
         # Detecta si la url_base tiene paginación
+        print(f"[SPIDER] Iniciando requests para url_base: {self.url_base}")
         num_page = 0
         if 'num_pag' in self.url_base:  
             url_base_pag = self.url_base.replace('num_pag', str(num_page))
@@ -133,25 +136,21 @@ class Description_Sku_Spider(scrapy.Spider):
             raise scrapy.exceptions.CloseSpider('Demasiados intentos fallidos para la url_base')
     
     def analyze_homepage(self, response):
-        print(f"Analizando la página {response.meta.get('num_page', 'N/A')} de {self.url_base}\n{'-'*80}")
+        print(f"[SPIDER] Analizando página {response.meta.get('num_page', 'N/A')} de {self.url_base}")
         product_links = response.xpath(self.xpath_link_sku).getall()
         if not product_links:
             print(f"No se encontraron productos en la página {response.meta.get('num_page', 'N/A')} de {self.url_base}.\n{'-'*80}")
             return  # No hay más productos, detén la paginación
 
         for url in product_links:
-            print(f"Enviando solicitud para el producto: {url}\n{'-'*80}")
+            #print(f"Enviando solicitud para el producto: {url}\n{'-'*80}")
             yield response.follow(url=url, callback=self.analyze_product_detail)
 
         # Si hay paginación, solicita la siguiente página
         if 'num_pag' in self.url_base and response.meta['num_page'] is not None:
-            print(f'La pagina {self.url_base} tiene paginación, solicitando la siguiente página...\n{"-"*80}')
-            print(f"self.secuencia = {self.secuencia} (tipo: {type(self.secuencia)})")
             num_page = response.meta['num_page'] + self.secuencia
-            print(f'Número de página actual: {num_page}')
             next_url = self.url_base.replace('num_pag', str(num_page))
-            print(f'URL de la siguiente página: {next_url}')
-            print(f'solicitando la siguiente página: {next_url}\n{"-"*80}')
+            print(f'[SPIDER] Solicitando siguiente página: {next_url}')
             yield scrapy.Request(
                 url=next_url,
                 callback=self.analyze_homepage,
@@ -160,45 +159,58 @@ class Description_Sku_Spider(scrapy.Spider):
             )
 
     def analyze_product_detail(self, response):
-        print(f"Analizando los detalles del producto: {response.url}")
+        print(f"[SPIDER] Extrayendo detalles de producto: {response.url}")
         # Extrae los datos del producto y los guarda en self.results
         def safe_xpath(xpath):
             try:
-                value = response.xpath(xpath).get(default='').strip()
-                return value if value else "no"
+                value = response.xpath(xpath).get(default='N/A').strip()
+                return value if value else "N/A"
             except Exception:
-                return "no"
-
+                return "N/A"
+        def get_full_image_url(xpath):
+            img_src = safe_xpath(xpath)
+            if img_src.startswith("http"):
+                return img_src
+            elif img_src != "N/A":
+                return self.url_base.split("/product")[0] + img_src
+            else:
+                return "N/A"
         item = {
-            'link': response.url,
+            'country': self.country,
+            'url_base': self.url_base,
+            'name_page': self.name_page,
+            'information': self.information,
             'sku': safe_xpath(self.xpath_sku),
-            'brand': safe_xpath(self.xpath_brand),
             'name_product': safe_xpath(self.xpath_name_product),
             'description_product': safe_xpath(self.xpath_description_product),
-            'image_product': safe_xpath(self.xpath_image_product),
             'category_product': safe_xpath(self.xpath_category_product),
             'esp_tecnic_product': safe_xpath(self.xpath_esp_tecnic_product),
             'price_product': safe_xpath(self.xpath_price_product),
-            'country': self.country,
-            'name_page': self.name_page,
-            'information': self.information,
-            'url_base': self.url_base
+            'brand': safe_xpath(self.xpath_brand),
+            'link': response.url,
+            'image_product': get_full_image_url(self.xpath_image_product)            
         }
         #para cada url_base se genera un diccionario con los datos de detalle de cada uno de los productos que se encuentran en cada una de 
         # las paginas de la url_base
-        print(f"Datos del producto extraídos: {item}\n{'-'*80}")
+        #print(f"Datos del producto extraídos: {item}\n{'-'*80}")
         self.resultados.append(item)
-        print(self.resultados)
+        #print(self.resultados)
 
     def closed(self, reason):
         # Guarda los resultados en el objeto crawler para poder acceder desde fuera
-        print(f'Cerrando y guardando los resultados para la url_base: {self.url_base}')
+        print(f"[SPIDER] Spider cerrado para url_base: {self.url_base} - Motivo: {reason}")
         #self.crawler.stats.set_value('results', self.results)
 
 def scrapear_productos(**kwargs):
     resultados = []
     kwargs['resultados'] = resultados  # Inicializa la lista de resultados en kwargs
-    process = CrawlerProcess(settings={"LOG_LEVEL": "CRITICAL"})
+    process = CrawlerProcess(settings={
+    "LOG_LEVEL": "CRITICAL",
+    "CONCURRENT_REQUESTS": 32,  # Más solicitudes en paralelo
+    "CONCURRENT_REQUESTS_PER_DOMAIN": 16,
+    "CONCURRENT_REQUESTS_PER_IP": 16,
+    "DOWNLOAD_DELAY": 0.1,      # Menor delay entre solicitudes
+    })
     process.crawl(Description_Sku_Spider, **kwargs)
     process.start()
         
@@ -209,12 +221,14 @@ def scrapear_productos(**kwargs):
 
 ruta=r'/home/sebastian/Documentos/programas/WebScraping/WebScraping Scrapy/all_links.xlsx'
 df=pd.read_excel(ruta, sheet_name='urls')
-df_base_url=df[df['url base']=='https://ar.blackanddecker.global/productos/herramientas-electricas?page=num_pag']
+df_base_url=df[(df['url base']=='https://ar.blackanddecker.global/productos/herramientas-electricas?page=num_pag')|
+               (df['url base']=='https://ar.blackanddecker.global/productos/herramientas-manuales?page=num_pag')]
 
-def scrapear_base_url(df_base_url):
-    df_final = pd.DataFrame()
-    for idx, fila in df_base_url.iterrows():
-        df_result = scrapear_productos(
+
+
+def run_spider(fila, resultados_compartidos):
+    print(f"\n[PROCESO] Iniciando spider para url_base: {fila['url base']}")
+    df_result = scrapear_productos(
         url_base=fila['url base'],
         xpath_link_sku=fila['Ruta Xpath link'],
         xpath_sku=fila['Ruta Xpath sku'],
@@ -230,17 +244,35 @@ def scrapear_base_url(df_base_url):
         name_page=fila['Name'],
         information=fila['Information'],
         secuencia=fila['Secuencia de paginacion']
-        )
-        print(df_result.head())
-        df_final = pd.concat([df_final, df_result], ignore_index=True)
-        print(f"Scrapeo completado para la url base: {fila['url base']}")
-        print(df_final.head())
-    return df_final  
+    )
+    print(f"[PROCESO] Finalizó spider para url_base: {fila['url base']}. Productos extraídos: {len(df_result)}")
+    # Convierte el DataFrame a dict y lo agrega a la lista compartida
+    resultados_compartidos += df_result.to_dict(orient='records')
 
+def scrapear_base_url_parallel(df_base_url, max_procesos=3):
+    manager = Manager()
+    resultados_compartidos = manager.list()
+    procesos = []
+    for idx, fila in df_base_url.iterrows():
+        print(f"\n[MAIN] Preparando proceso para url_base: {fila['url base']}")
+        p = Process(target=run_spider, args=(fila, resultados_compartidos))
+        procesos.append(p)
+        p.start()
+        # Limita el número de procesos simultáneos
+        if len(procesos) >= max_procesos:
+            print(f"[MAIN] Esperando a que terminen {len(procesos)} procesos activos...")
+            for p in procesos:
+                p.join()
+            procesos = []
+    # Espera a que terminen los procesos restantes
+    for p in procesos:
+        p.join()
+    print(f"[MAIN] Todos los procesos han finalizado.")    
+    # Une todos los resultados en un DataFrame
+    return pd.DataFrame(list(resultados_compartidos))
 
 if __name__ == "__main__":
-    print("Columnas del DataFrame:", df.columns)  # Esto te ayuda a depurar nombres de columnas
-    df_resultado = scrapear_base_url(df_base_url)
-    print(df_resultado)
-    # Si quieres guardar el resultado en un Excel:
-    df_resultado.to_excel("productos_blackanddecker.xlsx", index=False)
+    #print("[MAIN] Columnas del DataFrame:", df.columns)
+    df_resultado = scrapear_base_url_parallel(df_base_url, max_procesos=3)
+    print("[MAIN] Scraping terminado. Total de productos extraídos:", len(df_resultado))
+    df_resultado.to_excel("base_detalle_productos.xlsx", index=False)
